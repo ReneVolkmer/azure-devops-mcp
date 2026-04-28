@@ -56,6 +56,9 @@ const REPO_TOOLS = {
   get_pull_request_policy_evaluations: "repo_get_pull_request_policy_evaluations",
 };
 
+/** Maximum number of projects to fetch when resolving a project by name. Covers organizations with up to 200 projects. */
+const PROJECT_LOOKUP_MAX = 200;
+
 function branchesFilterOutIrrelevantProperties(branches: GitRef[], top: number) {
   return branches
     ?.flatMap((branch) => (branch.name ? [branch.name] : []))
@@ -2225,7 +2228,7 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<stri
         // The artifactId for a PR is in the form: vstfs:///CodeReview/CodeReviewId/<projectId>/<pullRequestId>
         // We need the project ID for this, so first resolve it.
         const coreApi = await connection.getCoreApi();
-        const projects = await coreApi.getProjects("wellFormed", 200);
+        const projects = await coreApi.getProjects("wellFormed", PROJECT_LOOKUP_MAX);
         const proj = projects?.find((p) => p.name === project || p.id === project);
 
         if (!proj?.id) {

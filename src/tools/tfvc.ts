@@ -17,7 +17,8 @@ const TFVC_TOOLS = {
   list_items: "tfvc_list_items",
 };
 
-const TEXT_CHANGE_TYPES = new Set(["edit", "add", "delete", "rename", "undelete", "branch", "merge", "property", "lock", "rollback", "sourceRename", "targetRename", "encoding"]);
+/** Maximum comment length returned by the TFVC API when listing changesets. Limits response size. */
+const MAX_COMMENT_LENGTH = 200;
 
 const BINARY_EXTENSIONS = new Set([
   ".png",
@@ -120,7 +121,7 @@ function configureTfvcTools(server: McpServer, _tokenProvider: () => Promise<str
         if (toDate) searchCriteria.toDate = toDate;
         if (itemPath) searchCriteria.itemPath = itemPath;
 
-        const changesets = await tfvcApi.getChangesets(project, 200, skip, top, orderby, searchCriteria);
+        const changesets = await tfvcApi.getChangesets(project, MAX_COMMENT_LENGTH, skip, top, orderby, searchCriteria);
 
         if (!changesets || changesets.length === 0) {
           return { content: [{ type: "text", text: "No changesets found." }] };
@@ -370,7 +371,7 @@ function computeUnifiedDiff(path: string, before: string, after: string, beforeI
   const m = beforeLines.length;
   const n = afterLines.length;
 
-  // For large files, limit to avoid excessive memory use
+  // Limit file size to avoid O(m*n) LCS memory explosion (5000 * 5000 = 25M cells × 8 bytes = ~200MB)
   const MAX_LINES = 5000;
   if (m > MAX_LINES || n > MAX_LINES) {
     return `--- ${path}\t(changeset ${beforeId})\n+++ ${path}\t(changeset ${afterId})\n@@ File too large for inline diff (>${MAX_LINES} lines). Use tfvc_get_item_content to retrieve each version separately. @@\n`;
