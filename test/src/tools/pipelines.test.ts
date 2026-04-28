@@ -1660,4 +1660,113 @@ describe("configurePipelineTools", () => {
       expect(result.content[0].resource.uri).toContain(expectedBase64);
     });
   });
+
+  describe("pipelines_get_failed_tasks_with_logs", () => {
+    function getHandler() {
+      configurePipelineTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "pipelines_get_failed_tasks_with_logs");
+      if (!call) throw new Error("pipelines_get_failed_tasks_with_logs tool not registered");
+      return call[3];
+    }
+
+    it("returns failed tasks with log tails", async () => {
+      const mockBuildApi = {
+        getBuildTimeline: jest.fn().mockResolvedValue({
+          records: [
+            {
+              id: "record-1",
+              name: "Build X++",
+              type: "Task",
+              result: 2, // Failed
+              log: { id: 10 },
+              issues: [{ type: 1, category: "Error", message: "Compilation failed" }],
+            },
+            {
+              id: "record-2",
+              name: "Run Tests",
+              type: "Task",
+              result: 0, // Succeeded
+              log: { id: 11 },
+              issues: [],
+            },
+          ],
+        }),
+        getBuildLogLines: jest.fn().mockResolvedValue(["line1", "line2", "Error: X++ compilation failed", "line4"]),
+      };
+      mockConnection.getBuildApi.mockResolvedValue(mockBuildApi);
+
+      const result = await getHandler()({ project: "test-project", buildId: 123, tailLines: 50 });
+
+      expect(mockBuildApi.getBuildTimeline).toHaveBeenCalledWith("test-project", 123);
+      // Only the failed task (result=2) should have its log fetched
+      expect(mockBuildApi.getBuildLogLines).toHaveBeenCalledWith("test-project", 123, 10);
+      expect(mockBuildApi.getBuildLogLines).not.toHaveBeenCalledWith("test-project", 123, 11);
+
+      // Response should be spotlighted (external content)
+      expect(result.content[0].text).toContain("UNTRUSTED");
+
+      // Content should mention the failed task
+      const parsedContent = JSON.parse(result.content[0].text.replace(/<<[0-9a-f]+>> \[UNTRUSTED[^\n]+\n/, "").replace(/\n<<\/[0-9a-f]+>>$/, ""));
+      expect(parsedContent.buildId).toBe(123);
+      expect(parsedContent.failedTasks).toHaveLength(1);
+      expect(parsedContent.failedTasks[0].name).toBe("Build X++");
+      expect(parsedContent.failedTasks[0].logId).toBe(10);
+      expect(parsedContent.failedTasks[0].issues[0].message).toBe("Compilation failed");
+    });
+
+    it("returns informational message when no failed tasks found", async () => {
+      const mockBuildApi = {
+        getBuildTimeline: jest.fn().mockResolvedValue({
+          records: [{ id: "record-1", name: "Build", type: "Task", result: 0, log: { id: 10 }, issues: [] }],
+        }),
+        getBuildLogLines: jest.fn(),
+      };
+      mockConnection.getBuildApi.mockResolvedValue(mockBuildApi);
+
+      const result = await getHandler()({ project: "test-project", buildId: 123, tailLines: 50 });
+
+      expect(mockBuildApi.getBuildLogLines).not.toHaveBeenCalled();
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.message).toContain("No failed tasks");
+    });
+
+    it("returns message when timeline is empty", async () => {
+      const mockBuildApi = {
+        getBuildTimeline: jest.fn().mockResolvedValue({ records: [] }),
+        getBuildLogLines: jest.fn(),
+      };
+      mockConnection.getBuildApi.mockResolvedValue(mockBuildApi);
+
+      const result = await getHandler()({ project: "test-project", buildId: 123, tailLines: 50 });
+      expect(result.content[0].text).toContain("No timeline records found");
+    });
+
+    it("returns error on API failure", async () => {
+      const mockBuildApi = {
+        getBuildTimeline: jest.fn().mockRejectedValue(new Error("Build not found")),
+        getBuildLogLines: jest.fn(),
+      };
+      mockConnection.getBuildApi.mockResolvedValue(mockBuildApi);
+
+      const result = await getHandler()({ project: "test-project", buildId: 999, tailLines: 50 });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("Build not found");
+    });
+
+    it("includes log fetch error in task output when log retrieval fails", async () => {
+      const mockBuildApi = {
+        getBuildTimeline: jest.fn().mockResolvedValue({
+          records: [{ id: "record-1", name: "Deploy", type: "Task", result: 2, log: { id: 20 }, issues: [] }],
+        }),
+        getBuildLogLines: jest.fn().mockRejectedValue(new Error("Log unavailable")),
+      };
+      mockConnection.getBuildApi.mockResolvedValue(mockBuildApi);
+
+      const result = await getHandler()({ project: "test-project", buildId: 123, tailLines: 50 });
+
+      expect(result.content[0].text).toContain("UNTRUSTED");
+      const parsedContent = JSON.parse(result.content[0].text.replace(/<<[0-9a-f]+>> \[UNTRUSTED[^\n]+\n/, "").replace(/\n<<\/[0-9a-f]+>>$/, ""));
+      expect(parsedContent.failedTasks[0].logTail[0]).toContain("Failed to retrieve log");
+    });
+  });
 });
