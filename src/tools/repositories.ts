@@ -52,7 +52,12 @@ const REPO_TOOLS = {
   vote_pull_request: "repo_vote_pull_request",
   list_directory: "repo_list_directory",
   get_file_content: "repo_get_file_content",
+  list_branch_policies: "repo_list_branch_policies",
+  get_pull_request_policy_evaluations: "repo_get_pull_request_policy_evaluations",
 };
+
+/** Maximum number of projects to fetch when resolving a project by name. Covers organizations with up to 200 projects. */
+const PROJECT_LOOKUP_MAX = 200;
 
 function branchesFilterOutIrrelevantProperties(branches: GitRef[], top: number) {
   return branches
@@ -2129,6 +2134,135 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<stri
           ],
           isError: true,
         };
+      }
+    }
+  );
+
+  server.tool(
+    REPO_TOOLS.list_branch_policies,
+    "List configured branch policies for a project, optionally scoped to a specific repository and/or branch. Returns policy type, configuration settings, and whether each policy is enabled and blocking.",
+    {
+      project: z.string().describe("Project ID or name where the branch policies are configured."),
+      repositoryId: z.string().optional().describe("Optional repository ID or name to filter policies to a specific repository."),
+      branch: z.string().optional().describe("Optional branch name (e.g. 'main' or 'refs/heads/main') to filter policies that apply to a specific branch."),
+      policyType: z.string().optional().describe("Optional policy type ID or name to filter to a specific type (e.g. 'fa4e907d-c16b-452d-8106-7efa0cb84489' for minimum reviewers)."),
+    },
+    async ({ project, repositoryId, branch, policyType }) => {
+      try {
+        const connection = await connectionProvider();
+        const policyApi = await connection.getPolicyApi();
+
+        // Build the scope filter: ADO PolicyAPI scopes are in the format
+        // vstfs:///CodeReview/CodeReviewId/<projectId>/<repoId>/<branchRef>
+        // We use getPolicyConfigurations and filter client-side for simplicity.
+        const configurationsPage = await policyApi.getPolicyConfigurations(project, undefined, policyType);
+        const configurations = (configurationsPage as unknown as { value?: unknown[] })?.value ?? (configurationsPage as unknown as unknown[]) ?? [];
+
+        let filtered = configurations as {
+          id?: number;
+          isEnabled?: boolean;
+          isBlocking?: boolean;
+          type?: { id?: string; displayName?: string };
+          settings?: Record<string, unknown>;
+          createdDate?: string;
+          revision?: number;
+        }[];
+
+        // Filter by repository if provided
+        if (repositoryId) {
+          filtered = filtered.filter((cfg) => {
+            const scopes = (cfg.settings?.scope as { repositoryId?: string }[] | undefined) ?? [];
+            return scopes.some((s) => s.repositoryId === repositoryId || s.repositoryId?.endsWith(repositoryId));
+          });
+        }
+
+        // Filter by branch if provided
+        if (branch) {
+          const branchRef = branch.startsWith("refs/heads/") ? branch : `refs/heads/${branch}`;
+          filtered = filtered.filter((cfg) => {
+            const scopes = (cfg.settings?.scope as { refName?: string }[] | undefined) ?? [];
+            // If no scope refName is set it applies to all branches
+            if (scopes.length === 0) return true;
+            return scopes.some((s) => !s.refName || s.refName === branchRef);
+          });
+        }
+
+        if (filtered.length === 0) {
+          return { content: [{ type: "text", text: "No branch policies found matching the criteria." }] };
+        }
+
+        const trimmed = filtered.map((cfg) => ({
+          id: cfg.id,
+          isEnabled: cfg.isEnabled,
+          isBlocking: cfg.isBlocking,
+          type: {
+            id: cfg.type?.id,
+            displayName: cfg.type?.displayName,
+          },
+          settings: cfg.settings,
+          createdDate: cfg.createdDate,
+          revision: cfg.revision,
+        }));
+
+        return { content: [{ type: "text", text: JSON.stringify(trimmed, null, 2) }] };
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+        return { content: [{ type: "text", text: `Error listing branch policies: ${errorMessage}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    REPO_TOOLS.get_pull_request_policy_evaluations,
+    "Get the current policy evaluation status for a specific pull request. Shows which policies pass, fail, are pending, or are not applicable. Essential for understanding merge readiness and compliance gates.",
+    {
+      project: z.string().describe("Project ID or name where the pull request is located."),
+      pullRequestId: z.coerce.number().min(1).describe("The ID of the pull request to get policy evaluations for."),
+      includeNotApplicable: z.boolean().optional().default(false).describe("Whether to include policies that are not applicable to this pull request. Defaults to false."),
+    },
+    async ({ project, pullRequestId, includeNotApplicable }) => {
+      try {
+        const connection = await connectionProvider();
+        const policyApi = await connection.getPolicyApi();
+
+        // The artifactId for a PR is in the form: vstfs:///CodeReview/CodeReviewId/<projectId>/<pullRequestId>
+        // We need the project ID for this, so first resolve it.
+        const coreApi = await connection.getCoreApi();
+        const projects = await coreApi.getProjects("wellFormed", PROJECT_LOOKUP_MAX);
+        const proj = projects?.find((p) => p.name === project || p.id === project);
+
+        if (!proj?.id) {
+          return { content: [{ type: "text", text: `Project '${project}' not found.` }], isError: true };
+        }
+
+        const artifactId = `vstfs:///CodeReview/CodeReviewId/${proj.id}/${pullRequestId}`;
+        const evaluations = await policyApi.getPolicyEvaluations(project, artifactId, includeNotApplicable);
+
+        if (!evaluations || evaluations.length === 0) {
+          return { content: [{ type: "text", text: "No policy evaluations found for this pull request." }] };
+        }
+
+        const trimmed = evaluations.map((ev) => ({
+          evaluationId: ev.evaluationId,
+          status: ev.status,
+          configuration: {
+            id: ev.configuration?.id,
+            isEnabled: ev.configuration?.isEnabled,
+            isBlocking: ev.configuration?.isBlocking,
+            type: {
+              id: ev.configuration?.type?.id,
+              displayName: ev.configuration?.type?.displayName,
+            },
+          },
+          startedDate: ev.startedDate,
+          completedDate: ev.completedDate,
+          context: ev.context,
+        }));
+
+        return { content: [{ type: "text", text: JSON.stringify(trimmed, null, 2) }] };
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+        return { content: [{ type: "text", text: `Error getting policy evaluations for pull request ${pullRequestId}: ${errorMessage}` }], isError: true };
       }
     }
   );

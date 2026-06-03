@@ -27,6 +27,7 @@ const PIPELINE_TOOLS = {
   pipelines_run_pipeline: "pipelines_run_pipeline",
   pipelines_list_artifacts: "pipelines_list_artifacts",
   pipelines_download_artifact: "pipelines_download_artifact",
+  pipelines_get_failed_tasks_with_logs: "pipelines_get_failed_tasks_with_logs",
 };
 
 function configurePipelineTools(server: McpServer, tokenProvider: () => Promise<string>, connectionProvider: () => Promise<WebApi>, userAgentProvider: () => string) {
@@ -605,6 +606,79 @@ function configurePipelineTools(server: McpServer, tokenProvider: () => Promise<
           },
         ],
       };
+    }
+  );
+
+  server.tool(
+    PIPELINE_TOOLS.pipelines_get_failed_tasks_with_logs,
+    "Get all failed tasks from a build along with the tail of their log output in a single call. Eliminates the need to manually correlate build logs with failed tasks. Use this tool to diagnose build failures and explain root causes.",
+    {
+      project: z.string().describe("Project ID or name containing the build."),
+      buildId: z.coerce.number().min(1).describe("The ID of the build to analyze for failures."),
+      tailLines: z.coerce.number().min(1).max(1000).default(50).describe("Number of lines to return from the end of each failed task's log. Defaults to 50."),
+    },
+    async ({ project, buildId, tailLines }) => {
+      try {
+        const connection = await connectionProvider();
+        const buildApi = await connection.getBuildApi();
+
+        const timeline = await buildApi.getBuildTimeline(project, buildId);
+
+        if (!timeline?.records || timeline.records.length === 0) {
+          return { content: [{ type: "text", text: `No timeline records found for build ${buildId}.` }] };
+        }
+
+        // TaskResult: 0=Succeeded, 1=SucceededWithIssues, 2=Failed, 3=Canceled, 4=Skipped, 5=Abandoned
+        const FAILED_RESULTS = new Set([2, 3, 5]); // Failed, Canceled, Abandoned
+        const failedRecords = timeline.records.filter((r) => r.result !== undefined && r.result !== null && FAILED_RESULTS.has(r.result as number) && r.log?.id !== undefined);
+
+        if (failedRecords.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  { buildId, message: "No failed tasks with logs found.", allRecordResults: timeline.records.map((r) => ({ name: r.name, type: r.type, result: r.result })) },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
+
+        const failedTasksWithLogs = await Promise.all(
+          failedRecords.map(async (record) => {
+            const logId = record.log!.id!;
+            try {
+              const logLines = await buildApi.getBuildLogLines(project, buildId, logId);
+              const tail = logLines && logLines.length > 0 ? logLines.slice(-tailLines) : [];
+              return {
+                name: record.name,
+                type: record.type,
+                result: record.result,
+                issues: record.issues?.map((issue) => ({ type: issue.type, category: issue.category, message: issue.message })),
+                logId,
+                logTail: tail,
+              };
+            } catch (logError) {
+              return {
+                name: record.name,
+                type: record.type,
+                result: record.result,
+                issues: record.issues?.map((issue) => ({ type: issue.type, category: issue.category, message: issue.message })),
+                logId,
+                logTail: [`(Failed to retrieve log: ${logError instanceof Error ? logError.message : String(logError)})`],
+              };
+            }
+          })
+        );
+
+        return createExternalContentResponse({ buildId, failedTasks: failedTasksWithLogs }, "build failure analysis");
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+        return { content: [{ type: "text", text: `Error analyzing failed tasks for build ${buildId}: ${errorMessage}` }], isError: true };
+      }
     }
   );
 }
